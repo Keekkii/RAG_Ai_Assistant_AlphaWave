@@ -125,14 +125,14 @@ def chat_stream(request: QuestionRequest, token: str = Depends(oauth2_scheme), u
         print(f"Memory Fetch Warning: {e}")
 
     return StreamingResponse(
-        stream_answer(
+        stream_answer(  #generator postaje html body
             request.question,
             user_email=user.email,
             user_name=user.user_metadata.get("full_name", "User"),
             chat_history=chat_history_str,
             session_start=request.session_start
         ),
-        media_type="text/event-stream",
+        media_type="text/event-stream", #SSE contnet-type
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
     )
 
