@@ -21,3 +21,4 @@ dist-ssr
 db.sqlite3
 data/
 *.log
+pdfs/

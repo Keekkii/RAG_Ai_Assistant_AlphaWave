@@ -8,8 +8,8 @@ reranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir="/tmp/flashran
 
 DB_CONFIG = {
     "host": "localhost",
-    "port": 5433,
-    "dbname": "alphawave_ai",
+    "port": 5434,
+    "dbname": "alphawave_comp",
     "user": "postgres",
     "password": "postgres"
 }
@@ -27,28 +27,26 @@ def get_connection():
 
 
 # -------------------------
-# Keyword extraction (simple)
-# -------------------------
-def extract_keywords(query: str):
-    words = query.lower().split()
-    # Common words we want to ignore
-    stop_words = {"what", "where", "when", "how", "who", "this", "that", "with", "from", "the", "and", "for", "your", "with", "is", "are"}
-    
-    keywords = []
-    for w in words:
-        clean = w.strip("?,.!")
-        # Keep words that are 3+ chars and NOT in stop_words
-        # OR special important acronyms
-        if (len(clean) >= 3 and clean not in stop_words) or clean in ["ai", "io", "ux", "3d"]:
-            keywords.append(clean)
-    
-    return keywords
-
-
-# -------------------------
 # Insert document
 # -------------------------
-def insert_document(url: str, title: str, content: str):
+def insert_parent_chunk(url: str, title: str, content: str, source_id: int = None) -> int:
+    """Insert a parent chunk without an embedding (used for context retrieval only)."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO documents (source_id, url, title, content)
+        VALUES (%s, %s, %s, %s)
+        RETURNING id;
+    """, (source_id, url, title, content))
+    new_id = cursor.fetchone()["id"]
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return new_id
+
+
+def insert_document(url: str, title: str, content: str, source_id: int = None, parent_id: int = None):
+    """Insert a child chunk with an embedding."""
     embedding = generate_embedding(content)
     vector_str = "[" + ",".join(map(str, embedding)) + "]"
 
@@ -56,10 +54,10 @@ def insert_document(url: str, title: str, content: str):
     cursor = conn.cursor()
 
     cursor.execute("""
-        INSERT INTO documents (url, title, content, embedding)
-        VALUES (%s, %s, %s, %s)
+        INSERT INTO documents (source_id, parent_id, url, title, content, embedding)
+        VALUES (%s, %s, %s, %s, %s, %s)
         RETURNING id;
-    """, (url, title, content, vector_str))
+    """, (source_id, parent_id, url, title, content, vector_str))
 
     new_id = cursor.fetchone()["id"]
     conn.commit()
@@ -71,101 +69,116 @@ def insert_document(url: str, title: str, content: str):
 
 
 # -------------------------
-# Hybrid search
+# Vector search (parent-child)
 # -------------------------
 def search_similar_documents(query: str, limit: int = 5):
     embedding = generate_embedding(query)
     vector_str = "[" + ",".join(map(str, embedding)) + "]"
-    keywords = extract_keywords(query)
 
     conn = get_connection()
     cursor = conn.cursor()
 
-    # 1. Fetch Top 40 by Vector Similarity
-    sql_vector = """
-        SELECT id, url, title, content,
+    # 1. Search child chunks (small, precise)
+    cursor.execute("""
+        SELECT id, parent_id, url, title, content,
                (1 - (embedding <=> %s)) as score
         FROM documents
-        WHERE embedding IS NOT NULL
+        WHERE embedding IS NOT NULL AND parent_id IS NOT NULL
         ORDER BY embedding <=> %s
-        LIMIT 40;
-    """
-    cursor.execute(sql_vector, (vector_str, vector_str))
-    vector_results = cursor.fetchall()
+        LIMIT 20;
+    """, (vector_str, vector_str))
+    child_results = cursor.fetchall()
 
-    # 2. Fetch Top 40 by Keyword Matching
-    keyword_results = []
-    if keywords:
-        like_clauses = []
-        params = []
-        for word in keywords:
-            like_clauses.append("(title ILIKE %s OR content ILIKE %s)")
-            params.extend([f"%{word}%", f"%{word}%"])
+    # 2. Collect unique parent IDs in score order
+    seen_parents = set()
+    parent_ids = []
+    for r in child_results:
+        pid = r["parent_id"]
+        if pid not in seen_parents:
+            seen_parents.add(pid)
+            parent_ids.append(pid)
 
-        keyword_sql = " + ".join([f"(CASE WHEN {clause} THEN 1 ELSE 0 END)" for clause in like_clauses])
+    if not parent_ids:
+        cursor.close()
+        conn.close()
+        return []
 
-        sql_keyword = f"""
-            SELECT id, url, title, content,
-                   ({keyword_sql}) as score
-            FROM documents
-            WHERE { " OR ".join(like_clauses) }
-            ORDER BY ({keyword_sql}) DESC
-            LIMIT 40;
-        """
-        # We need to repeat params for: 1. SELECT, 2. WHERE, 3. ORDER BY
-        all_params = params * 3
-        cursor.execute(sql_keyword, all_params)
-        keyword_results = cursor.fetchall()
-
+    # 3. Fetch parent chunks (full context for LLM)
+    cursor.execute(
+        "SELECT id, url, title, content FROM documents WHERE id = ANY(%s);",
+        (parent_ids,)
+    )
+    parent_map = {r["id"]: dict(r) for r in cursor.fetchall()}
     cursor.close()
     conn.close()
 
-    # 3. Reciprocal Rank Fusion (RRF)
-    # RRF Score = 1 / (rank + k), where k is a constant (e.g., 60)
-    k = 60
-    scores = {}
-    doc_map = {}
-
-    def add_to_scores(results):
-        for rank, doc in enumerate(results):
-            doc_id = doc["id"]
-            doc_map[doc_id] = doc
-            if doc_id not in scores:
-                scores[doc_id] = 0
-            scores[doc_id] += 1.0 / (rank + 1 + k)
-
-    add_to_scores(vector_results)
-    add_to_scores(keyword_results)
-
-    # Sort by RRF score, take top 20 diverse candidates for reranking (max 2 per URL)
-    sorted_ids = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
+    # 4. Build candidates: one per unique parent, scored by best child match
     candidates = []
-    url_counts = {}
-    for doc_id in sorted_ids:
-        if len(candidates) >= 20:
-            break
-        doc = doc_map[doc_id]
-        url = doc.get("url", "")
-        if url_counts.get(url, 0) >= 2:
-            continue
-        url_counts[url] = url_counts.get(url, 0) + 1
-        doc["rrf_score"] = scores[doc_id]
-        doc["distance"] = 1 - doc.get("score", 0) if "score" in doc else 1.0
-        candidates.append(doc)
+    seen = set()
+    for child in child_results:
+        pid = child["parent_id"]
+        if pid in parent_map and pid not in seen:
+            seen.add(pid)
+            parent = dict(parent_map[pid])
+            parent["score"] = child["score"]
+            parent["rrf_score"] = child["score"]
+            parent["distance"] = 1 - child["score"]
+            candidates.append(parent)
 
-    # Rerank candidates with FlashRank cross-encoder
+    # 5. Rerank by parent content
     passages = [{"id": i, "text": doc["content"]} for i, doc in enumerate(candidates)]
     rerank_request = RerankRequest(query=query, passages=passages)
     reranked = reranker.rerank(rerank_request)
 
-    # Build final results in reranked order
     final_results = []
     for item in reranked[:limit]:
         doc = candidates[item["id"]]
-        doc["rerank_score"] = float(item["score"])  # keep original rrf_score intact
+        doc["rerank_score"] = float(item["score"])
         final_results.append(doc)
 
     return final_results
+
+
+# -------------------------
+# Source management
+# -------------------------
+def create_source(filename: str, title: str) -> int:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO sources (filename, title, status) VALUES (%s, %s, 'pending') RETURNING id;",
+        (filename, title)
+    )
+    source_id = cursor.fetchone()["id"]
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return source_id
+
+
+def finalize_source(source_id: int, chunk_count: int, status: str = "done"):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE sources SET chunk_count = %s, status = %s WHERE id = %s;",
+        (chunk_count, status, source_id)
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def source_already_ingested(filename: str) -> bool:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id FROM sources WHERE filename = %s AND status = 'done';",
+        (filename,)
+    )
+    exists = cursor.fetchone() is not None
+    cursor.close()
+    conn.close()
+    return exists
 
 
 # -------------------------

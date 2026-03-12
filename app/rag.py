@@ -8,7 +8,7 @@ LLM_MODEL = "qwen2.5:7b"
 llm = ChatOllama(
     model=LLM_MODEL,
     num_ctx=4096,     # Optimized context window for speed and accuracy
-    temperature=0     # Factual responses, no creative drifting
+    temperature=0.1     # Factual responses, no creative drifting
 )
 
 RAG_PROMPT = PromptTemplate(
